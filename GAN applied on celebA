@@ -1,0 +1,471 @@
+import tensorflow as tf
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import zipfile
+import urllib.request
+from tensorflow.keras import layers
+from cleanfid import fid
+import time
+from PIL import Image
+import glob
+from tensorflow.keras.layers import Lambda
+
+# ----------------------------
+# GPU Configuration
+# ----------------------------
+print("TensorFlow version:", tf._version_)
+print("GPU Available: ", tf.config.list_physical_devices('GPU'))
+
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"GPU memory growth enabled for {len(gpus)} GPU(s)")
+    except RuntimeError as e:
+        print(e)
+
+# ----------------------------
+# Hyperparameters
+# ----------------------------
+IMAGE_SIZE = 64  # Start with 64x64 for faster training
+BATCH_SIZE = 16  # Smaller batch size for StyleGAN
+LATENT_DIM = 512  # StyleGAN latent dimension
+STYLE_DIM = 512   # Style vector dimension
+EPOCHS = 300
+LEARNING_RATE = 0.0002
+BETA_1 = 0.0
+BETA_2 = 0.99
+
+# ----------------------------
+# Download and Prepare CelebA Dataset
+# ----------------------------
+def download_celeba_sample():
+    """Download a sample of CelebA dataset"""
+    url = "https://drive.google.com/uc?id=1cNIac61PSA_LqDFYFUeyaQYekYPc75NH"  # Sample CelebA
+    if not os.path.exists("celeba_sample.zip"):
+        print("Downloading CelebA sample...")
+        # For this example, we'll create a synthetic dataset
+        # In practice, you would download the real CelebA dataset
+        create_synthetic_celeba()
+    else:
+        extract_celeba()
+
+def create_synthetic_celeba():
+    """Create synthetic face-like data for demonstration"""
+    print("Creating synthetic face dataset...")
+    os.makedirs("celeba_dataset/train", exist_ok=True)
+    os.makedirs("celeba_dataset/test", exist_ok=True)
+
+    # Generate synthetic face-like images
+    np.random.seed(42)
+    for split, num_images in [("train", 10000), ("test", 1000)]:
+        for i in range(num_images):
+            # Create a face-like pattern
+            img = np.random.rand(IMAGE_SIZE, IMAGE_SIZE, 3) * 255
+
+            # Add face-like structure
+            center_x, center_y = IMAGE_SIZE//2, IMAGE_SIZE//2
+
+            # Face oval
+            y, x = np.ogrid[:IMAGE_SIZE, :IMAGE_SIZE]
+            mask = ((x - center_x)*2 + (y - center_y)2) < (IMAGE_SIZE//3)*2
+            img[mask] = img[mask] * 0.8 + 50
+
+            # Eyes
+            eye1_x, eye1_y = center_x - IMAGE_SIZE//6, center_y - IMAGE_SIZE//8
+            eye2_x, eye2_y = center_x + IMAGE_SIZE//6, center_y - IMAGE_SIZE//8
+
+            eye_mask1 = ((x - eye1_x)*2 + (y - eye1_y)2) < (IMAGE_SIZE//20)*2
+            eye_mask2 = ((x - eye2_x)*2 + (y - eye2_y)2) < (IMAGE_SIZE//20)*2
+
+            img[eye_mask1] = 20
+            img[eye_mask2] = 20
+
+            # Mouth
+            mouth_y = center_y + IMAGE_SIZE//6
+            mouth_mask = ((x - center_x)*2 + (y - mouth_y)2) < (IMAGE_SIZE//25)*2
+            img[mouth_mask] = 30
+
+            img = np.clip(img, 0, 255).astype(np.uint8)
+
+            # Save image
+            plt.imsave(f"celeba_dataset/{split}/face_{i:05d}.png", img)
+
+            if i % 1000 == 0:
+                print(f"Generated {i}/{num_images} {split} images")
+
+def extract_celeba():
+    """Extract CelebA dataset if zip exists"""
+    with zipfile.ZipFile("celeba_sample.zip", 'r') as zip_ref:
+        zip_ref.extractall("celeba_dataset")
+
+# Download/create dataset
+if not os.path.exists("celeba_dataset"):
+    download_celeba_sample()
+
+# ----------------------------
+# Data Loading and Preprocessing
+# ----------------------------
+def load_celeba_dataset():
+    """Load and preprocess CelebA dataset"""
+    train_images = []
+    test_images = []
+
+    # Load training images
+    train_files = glob.glob("celeba_dataset/train/*.png")[:8000]  # Limit for memory
+    for file_path in train_files:
+        img = Image.open(file_path).resize((IMAGE_SIZE, IMAGE_SIZE))
+        img = np.array(img)[..., :3] / 127.5 - 1.0  # Normalize to [-1, 1] and exclude alpha channel
+        train_images.append(img)
+
+    # Load test images
+    test_files = glob.glob("celeba_dataset/test/*.png")
+    for file_path in test_files:
+        img = Image.open(file_path).resize((IMAGE_SIZE, IMAGE_SIZE))
+        img = np.array(img) / 127.5 - 1.0
+        test_images.append(img)
+
+    train_images = np.array(train_images, dtype=np.float32)
+    test_images = np.array(test_images, dtype=np.float32)
+
+    print(f"Loaded {len(train_images)} training images and {len(test_images)} test images")
+    return train_images, test_images
+
+train_images, test_images = load_celeba_dataset()
+
+# Create TensorFlow dataset
+train_dataset = tf.data.Dataset.from_tensor_slices(train_images)
+train_dataset = train_dataset.shuffle(1000).batch(BATCH_SIZE, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
+
+# ----------------------------
+# StyleGAN Components
+# ----------------------------
+class AdaIN(layers.Layer):
+    """Adaptive Instance Normalization"""
+    def _init_(self, **kwargs):
+        super(AdaIN, self)._init_(**kwargs)
+
+    def build(self, input_shape):
+        self.epsilon = 1e-8
+
+    def call(self, inputs):
+        content, style = inputs
+
+        # Get content statistics
+        content_mean = tf.reduce_mean(content, axis=[1, 2], keepdims=True)
+        content_std = tf.math.reduce_std(content, axis=[1, 2], keepdims=True) + self.epsilon
+
+        # Normalize content
+        normalized_content = (content - content_mean) / content_std
+
+        # Apply style
+        styled_content = normalized_content * style[:, :, :, :content.shape[-1]] + style[:, :, :, content.shape[-1]:]
+
+        return styled_content
+
+class StyleBlock(layers.Layer):
+    """StyleGAN style block with AdaIN"""
+    def _init_(self, filters, **kwargs):
+        super(StyleBlock, self)._init_(**kwargs)
+        self.filters = filters
+
+    def build(self, input_shape):
+        self.conv = layers.Conv2D(self.filters, 3, padding='same', activation=None)
+        self.adain = AdaIN()
+        self.activation = layers.LeakyReLU(0.2)
+
+    def call(self, inputs):
+        content, style = inputs
+        x = self.conv(content)
+        x = self.adain([x, style])
+        x = self.activation(x)
+        return x
+
+class MappingNetwork(layers.Layer):
+    """StyleGAN mapping network"""
+    def _init_(self, style_dim, num_layers=8, **kwargs):
+        super(MappingNetwork, self)._init_(**kwargs)
+        self.style_dim = style_dim
+        self.num_layers = num_layers
+
+    def build(self, input_shape):
+        self.dense_layers = []
+        for i in range(self.num_layers):
+            self.dense_layers.append(layers.Dense(self.style_dim, activation='relu'))
+
+    def call(self, inputs):
+        x = inputs
+        for dense in self.dense_layers:
+            x = dense(x)
+        return x
+
+# ----------------------------
+# StyleGAN Generator
+# ----------------------------
+def make_stylegan_generator():
+    # Mapping Network
+    latent_input = layers.Input(shape=(LATENT_DIM,))
+    style_vector = MappingNetwork(STYLE_DIM)(latent_input)
+
+    # Synthesis Network
+    # Start with learned constant
+    x = layers.Dense(4*4*512, activation='relu')(style_vector)
+    x = layers.Reshape((4, 4, 512))(x)
+
+    # Style modulation for constant
+    style_4x4 = layers.Dense(512*2)(style_vector)  # Mean and std for AdaIN
+    style_4x4 = layers.Reshape((1, 1, 512*2))(style_4x4)
+    style_4x4 = Lambda(lambda x: tf.tile(x, [1, 4, 4, 1]))(style_4x4)
+
+    x = StyleBlock(512)([x, style_4x4])
+
+    # 4x4 -> 8x8
+    x = layers.UpSampling2D()(x)
+    style_8x8 = layers.Dense(512*2)(style_vector)
+    style_8x8 = layers.Reshape((1, 1, 512*2))(style_8x8)
+    style_8x8 = Lambda(lambda x: tf.tile(x, [1, 8, 8, 1]))(style_8x8)
+    x = StyleBlock(512)([x, style_8x8])
+
+    # 8x8 -> 16x16
+    x = layers.UpSampling2D()(x)
+    style_16x16 = layers.Dense(256*2)(style_vector)
+    style_16x16 = layers.Reshape((1, 1, 256*2))(style_16x16)
+    style_16x16 = Lambda(lambda x: tf.tile(x, [1, 16, 16, 1]))(style_16x16)
+    x = StyleBlock(256)([x, style_16x16])
+
+    # 16x16 -> 32x32
+    x = layers.UpSampling2D()(x)
+    style_32x32 = layers.Dense(128*2)(style_vector)
+    style_32x32 = layers.Reshape((1, 1, 128*2))(style_32x32)
+    style_32x32 = Lambda(lambda x: tf.tile(x, [1, 32, 32, 1]))(style_32x32)
+    x = StyleBlock(128)([x, style_32x32])
+
+    # 32x32 -> 64x64
+    x = layers.UpSampling2D()(x)
+    style_64x64 = layers.Dense(64*2)(style_vector)
+    style_64x64 = layers.Reshape((1, 1, 64*2))(style_64x64)
+    style_64x64 = Lambda(lambda x: tf.tile(x, [1, 64, 64, 1]))(style_64x64)
+    x = StyleBlock(64)([x, style_64x64])
+
+    # Final RGB output
+    rgb_output = layers.Conv2D(3, 1, activation='tanh', padding='same')(x)
+
+    model = tf.keras.Model(latent_input, rgb_output, name='StyleGAN_Generator')
+    return model
+
+# ----------------------------
+# Progressive Discriminator
+# ----------------------------
+def make_progressive_discriminator():
+    model = tf.keras.Sequential([
+        # 64x64 input
+        layers.Conv2D(64, 4, strides=2, padding='same', input_shape=[IMAGE_SIZE, IMAGE_SIZE, 3]),
+        layers.LeakyReLU(0.2),
+
+        # 32x32
+        layers.Conv2D(128, 4, strides=2, padding='same'),
+        layers.BatchNormalization(),
+        layers.LeakyReLU(0.2),
+
+        # 16x16
+        layers.Conv2D(256, 4, strides=2, padding='same'),
+        layers.BatchNormalization(),
+        layers.LeakyReLU(0.2),
+
+        # 8x8
+        layers.Conv2D(512, 4, strides=2, padding='same'),
+        layers.BatchNormalization(),
+        layers.LeakyReLU(0.2),
+
+        # 4x4
+        layers.Conv2D(1024, 4, strides=2, padding='same'),
+        layers.BatchNormalization(),
+        layers.LeakyReLU(0.2),
+
+        # Final classification
+        layers.Flatten(),
+        layers.Dense(1)
+    ])
+    return model
+
+# ----------------------------
+# Loss Functions
+# ----------------------------
+def generator_loss(fake_output):
+    return tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+        logits=fake_output, labels=tf.ones_like(fake_output)))
+
+def discriminator_loss(real_output, fake_output):
+    real_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+        logits=real_output, labels=tf.ones_like(real_output) * 0.9))  # Label smoothing
+    fake_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+        logits=fake_output, labels=tf.zeros_like(fake_output)))
+    return real_loss + fake_loss
+
+# Create models
+generator = make_stylegan_generator()
+discriminator = make_progressive_discriminator()
+
+# Optimizers
+generator_optimizer = tf.keras.optimizers.Adam(LEARNING_RATE, beta_1=BETA_1, beta_2=BETA_2)
+discriminator_optimizer = tf.keras.optimizers.Adam(LEARNING_RATE, beta_1=BETA_1, beta_2=BETA_2)
+
+print("Generator summary:")
+generator.summary()
+
+# ----------------------------
+# Training Step
+# ----------------------------
+@tf.function
+def train_step(real_images):
+    batch_size = tf.shape(real_images)[0]
+    noise = tf.random.normal([batch_size, LATENT_DIM])
+
+    # Train discriminator
+    with tf.GradientTape() as disc_tape:
+        generated_images = generator(noise, training=False)
+        real_output = discriminator(tf.expand_dims(real_images, axis=0), training=True)
+        fake_output = discriminator(generated_images, training=True)
+        disc_loss = discriminator_loss(real_output, fake_output)
+
+    disc_gradients = disc_tape.gradient(disc_loss, discriminator.trainable_variables)
+    discriminator_optimizer.apply_gradients(zip(disc_gradients, discriminator.trainable_variables))
+
+    # Train generator
+    with tf.GradientTape() as gen_tape:
+        generated_images = generator(noise, training=True)
+        fake_output = discriminator(generated_images, training=False)
+        gen_loss = generator_loss(fake_output)
+
+    gen_gradients = gen_tape.gradient(gen_loss, generator.trainable_variables)
+    generator_optimizer.apply_gradients(zip(gen_gradients, generator.trainable_variables))
+
+    return gen_loss, disc_loss
+
+# ----------------------------
+# Training Loop
+# ----------------------------
+def train_stylegan(dataset, epochs):
+    best_fid = float('inf')
+
+    for epoch in range(epochs):
+        start_time = time.time()
+        gen_loss_sum = 0.0
+        disc_loss_sum = 0.0
+        num_batches = 0
+
+        for step, image_batch in enumerate(dataset):
+            gen_loss, disc_loss = train_step(image_batch)
+            gen_loss_sum += gen_loss
+            disc_loss_sum += disc_loss
+            num_batches += 1
+
+            if step % 50 == 0:
+                print(f'Epoch {epoch+1}, Step {step}: Gen Loss: {gen_loss:.4f}, Disc Loss: {disc_loss:.4f}')
+
+        epoch_time = time.time() - start_time
+        avg_gen_loss = gen_loss_sum / num_batches
+        avg_disc_loss = disc_loss_sum / num_batches
+
+        print(f'Epoch {epoch+1}/{epochs} completed in {epoch_time:.2f}s - Gen Loss: {avg_gen_loss:.4f}, Disc Loss: {avg_disc_loss:.4f}')
+
+        # Generate sample images and compute FID every 30 epochs
+        if (epoch + 1) % 30 == 0:
+            print(f"Generating sample images for epoch {epoch+1}...")
+            save_generated_images(generator, f"stylegan_generated_epoch_{epoch+1}", num_images=1000)
+
+            try:
+                fid_score = fid.compute_fid(
+                    f"stylegan_generated_epoch_{epoch+1}",
+                    "celeba_dataset/test",
+                    dataset_res=IMAGE_SIZE,
+                    num_workers=0,
+                    batch_size=32,
+                    num_gen=1000,
+                    verbose=False
+                )
+                print(f"FID Score at epoch {epoch+1}: {fid_score:.2f}")
+
+                if fid_score < best_fid:
+                    best_fid = fid_score
+                    generator.save_weights(f"best_stylegan_generator_fid_{fid_score:.2f}.h5")
+                    print(f"New best FID: {fid_score:.2f} - Model saved!")
+
+                    if fid_score < 100:
+                        print(f"Target FID < 100 achieved! Final FID: {fid_score:.2f}")
+                        return fid_score
+
+            except Exception as e:
+                print(f"Error computing FID: {e}")
+
+        # Save sample images every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            generate_and_save_sample_images(epoch + 1)
+
+    return None
+
+# ----------------------------
+# Image Generation and Saving
+# ----------------------------
+def save_generated_images(generator, out_dir, num_images=1000):
+    """Generate and save images for FID calculation"""
+    os.makedirs(out_dir, exist_ok=True)
+
+    batch_size = 32
+    for batch_start in range(0, num_images, batch_size):
+        batch_end = min(batch_start + batch_size, num_images)
+        current_batch_size = batch_end - batch_start
+
+        noise = tf.random.normal([current_batch_size, LATENT_DIM])
+        generated_images = generator(noise, training=False)
+        generated_images = (generated_images * 127.5 + 127.5).numpy().astype(np.uint8)
+
+        for i in range(current_batch_size):
+            plt.imsave(f"{out_dir}/generated_{batch_start + i:05d}.png", generated_images[i])
+
+def generate_and_save_sample_images(epoch):
+    """Generate a grid of sample images"""
+    noise = tf.random.normal([16, LATENT_DIM])
+    generated_images = generator(noise, training=False)
+    generated_images = (generated_images * 127.5 + 127.5).numpy().astype(np.uint8)
+
+    fig, axes = plt.subplots(4, 4, figsize=(8, 8))
+    for i, ax in enumerate(axes.flat):
+        ax.imshow(generated_images[i])
+        ax.axis('off')
+
+    plt.tight_layout()
+    plt.savefig(f'stylegan_samples_epoch_{epoch}.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Sample images saved: stylegan_samples_epoch_{epoch}.png")
+
+# ----------------------------
+# Main Training Execution
+# ----------------------------
+print("Starting StyleGAN training on CelebA...")
+print(f"Image size: {IMAGE_SIZE}x{IMAGE_SIZE}")
+print(f"Batch size: {BATCH_SIZE}")
+print(f"Latent dimension: {LATENT_DIM}")
+print(f"Style dimension: {STYLE_DIM}")
+
+
+
+final_fid = train_stylegan(train_images, EPOCHS)
+
+if final_fid is None:
+    print("Generating final evaluation images...")
+    save_generated_images(generator, "final_stylegan_generated", num_images=2000)
+
+    print("Computing final FID score...")
+    final_score = fid.compute_fid(
+        "final_stylegan_generated",
+        "celeba_dataset/test",
+        dataset_res=IMAGE_SIZE,
+        num_workers=0,
+        batch_size=32,
+        num_gen=2000,
+        verbose=True
+    )
+    print(f"Final StyleGAN FID: {final_score:.2f}")
